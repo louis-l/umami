@@ -1,0 +1,119 @@
+# Builds Umami on GitHub's machines and deploys only the build to Sites-Server
+# (stats.vaocherapp.com). The server never builds: it updates the database,
+# switches to the new release and reloads PM2 without downtime.
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'louis-l/umami'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      APP_DIR: /home/va/stats.vaocherapp.com
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12.3.4
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+        env:
+          # The build never connects to a database; the real one is only used on the server.
+          DATABASE_URL: postgresql://user:pass@localhost:5432/dummy
+          SKIP_DB_CHECK: 1
+          DISABLE_TELEMETRY: 1
+          NEXT_TELEMETRY_DISABLED: 1
+
+      - name: Package the release
+        run: |
+          mkdir release
+          cp -a .next/standalone/. release/
+          cp -a .next/static release/.next/
+          cp -a public geo release/
+          # Prisma CLI and migrations, to update the database on the server before the switch.
+          mkdir release/migrate
+          cp -a prisma prisma.config.ts release/migrate/
+          prisma_version=$(node -p "require('./node_modules/prisma/package.json').version")
+          dotenv_version=$(node -p "require('./node_modules/dotenv/package.json').version")
+          cd release/migrate
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --loglevel=error "prisma@$prisma_version" "dotenv@$dotenv_version"
+          cd ../..
+          tar -czf release.tgz -C release .
+
+      - name: Upload and switch to the new release
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key)
+          ssh_va() { ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "va@$DEPLOY_HOST" "$@"; }
+
+          release=$(date -u +%Y%m%d%H%M%S)
+          ssh_va "mkdir $APP_DIR/releases/$release && tar -xzf - -C $APP_DIR/releases/$release" < release.tgz
+          ssh_va bash -s -- "$APP_DIR" "$release" <<'REMOTE'
+          set -euo pipefail
+          app=$1
+          release=$app/releases/$2
+          previous=
+          if [ -L "$app/current" ]; then previous=$(readlink -f "$app/current"); fi
+
+          # Update the database while the current release keeps serving.
+          cd "$release/migrate"
+          CHECKPOINT_DISABLE=1 node --env-file="$app/shared/.env" node_modules/prisma/build/index.js migrate deploy
+
+          switch_to() {
+            ln -sfn "$1" "$app/current.new" &&
+              mv -T "$app/current.new" "$app/current" &&
+              pm2 startOrReload "$app/ecosystem.config.cjs" --update-env
+          }
+
+          healthy() {
+            for _ in $(seq 1 20); do
+              curl -fsS -o /dev/null http://127.0.0.1:3002/api/heartbeat && return 0
+              sleep 3
+            done
+            return 1
+          }
+
+          if ! { switch_to "$release" && healthy; }; then
+            echo "The new release didn't start."
+            if [ -n "$previous" ]; then
+              echo "Switching back to the previous release."
+              switch_to "$previous"
+            fi
+            exit 1
+          fi
+
+          pm2 save
+          # Keep the 5 newest releases.
+          cd "$app/releases"
+          ls -1 | sort -r | tail -n +6 | xargs -r rm -rf --
+          REMOTE
